@@ -48,7 +48,20 @@ function clientErrorStatus(err) {
   ) {
     return 503;
   }
-  if (msg.includes("econnrefused") || msg.includes("connection refused") || msg.includes("failed to connect")) return 503;
+  if (
+    msg.includes("econnrefused") ||
+    msg.includes("connection refused") ||
+    msg.includes("failed to connect") ||
+    msg.includes("server selection") ||
+    msg.includes("timed out") ||
+    msg.includes("topology") ||
+    msg.includes("etimedout") ||
+    msg.includes("enotfound") ||
+    msg.includes("ehostunreach") ||
+    msg.includes("eai_again")
+  ) {
+    return 503;
+  }
   // Some Mongoose cast failures come with these shapes too.
   if (typeof err.message === "string" && err.message.toLowerCase().includes("cast to")) return 400;
   if (typeof err.message === "string" && err.message.toLowerCase().includes("objectid")) return 400;
