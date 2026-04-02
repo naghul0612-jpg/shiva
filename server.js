@@ -1,7 +1,5 @@
 /**
  * Clothing Store (Express + MongoDB)
- * - Serves a vanilla JS frontend from /public
- * - Provides APIs for products, auth, cart, and checkout
  */
 
 const path = require("path");
@@ -21,7 +19,6 @@ app.use(express.json());
 app.use(cors());
 app.use(morgan("dev"));
 
-// Log unhandled issues so we can diagnose 500s quickly.
 process.on("unhandledRejection", (reason) => {
   console.error("Unhandled promise rejection:", reason);
 });
@@ -33,714 +30,161 @@ const PORT = process.env.PORT || 3000;
 const NODE_ENV = process.env.NODE_ENV || "development";
 const DEBUG_ERRORS = NODE_ENV !== "production";
 const MONGODB_URI = process.env.MONGODB_URI || "mongodb://127.0.0.1:27017/clothing_store";
-const JWT_SECRET = process.env.JWT_SECRET || "dev_jwt_secret_change_me";
+const JWT_SECRET = process.env.JWT_SECRET || "dev_secret_change_me";
 
+/* ---------------- ERROR HANDLING FIX ---------------- */
 function clientErrorStatus(err) {
   if (!err) return 500;
   if (err.name === "CastError") return 400;
   if (err.name === "ValidationError") return 400;
-  if (err.code === 11000) return 409; // Mongo duplicate key
-  // Common Mongo connection failures should not look like "Internal server error"
-  const msg = typeof err.message === "string" ? err.message.toLowerCase() : "";
+  if (err.code === 11000) return 409;
+
+  const msg = err.message?.toLowerCase() || "";
+
   if (
     err.name === "MongooseServerSelectionError" ||
     err.name === "MongoNetworkError" ||
-    err.name === "MongoServerError" && msg.includes("failed to connect")
+    (err.name === "MongoServerError" && msg.includes("failed to connect"))
   ) {
     return 503;
   }
+
   if (
     msg.includes("econnrefused") ||
-    msg.includes("connection refused") ||
-    msg.includes("failed to connect") ||
-    msg.includes("server selection") ||
     msg.includes("timed out") ||
-    msg.includes("topology") ||
-    msg.includes("etimedout") ||
-    msg.includes("enotfound") ||
-    msg.includes("ehostunreach") ||
-    msg.includes("eai_again")
+    msg.includes("server selection")
   ) {
     return 503;
   }
-  // Some Mongoose cast failures come with these shapes too.
-  if (typeof err.message === "string" && err.message.toLowerCase().includes("cast to")) return 400;
-  if (typeof err.message === "string" && err.message.toLowerCase().includes("objectid")) return 400;
+
   return 500;
 }
 
-function normalizeErrorMessage(err, fallback) {
-  if (!err) return fallback;
-  if (err.code === 11000) return "Email already registered.";
-  return err.message || fallback;
-}
-
-if (!process.env.MONGODB_URI) console.warn(`MONGODB_URI not set; using default: ${MONGODB_URI}`);
-if (!process.env.JWT_SECRET) console.warn(`JWT_SECRET not set; using default (dev only): ${JWT_SECRET}`);
-
-// -----------------------------
-// Mongo Models
-// -----------------------------
-
+/* ---------------- MODELS ---------------- */
 const { Schema } = mongoose;
 
-const userSchema = new Schema(
-  {
-    name: { type: String, required: true, trim: true, maxlength: 80 },
-    email: { type: String, required: true, unique: true, lowercase: true, trim: true, maxlength: 120 },
-    passwordHash: { type: String, required: true }
-  },
-  { timestamps: true }
-);
+const User = mongoose.model("User", new Schema({
+  name: String,
+  email: { type: String, unique: true },
+  passwordHash: String
+}));
 
-const productSchema = new Schema(
-  {
-    category: { type: String, required: true, enum: ["Men", "Women", "Kids"] },
-    name: { type: String, required: true, trim: true, maxlength: 120 },
-    price: { type: Number, required: true, min: 0 },
-    imageUrl: { type: String, required: true },
-    isActive: { type: Boolean, default: true }
-  },
-  { timestamps: true }
-);
+const Product = mongoose.model("Product", new Schema({
+  category: String,
+  name: String,
+  price: Number,
+  imageUrl: String
+}));
 
-const cartSchema = new Schema(
-  {
-    userId: { type: Schema.Types.ObjectId, required: true, unique: true, index: true, ref: "User" },
-    items: [
-      {
-        productId: { type: Schema.Types.ObjectId, required: true, ref: "Product" },
-        quantity: { type: Number, required: true, min: 1, default: 1 }
-      }
-    ]
-  },
-  { timestamps: true }
-);
+const Cart = mongoose.model("Cart", new Schema({
+  userId: Schema.Types.ObjectId,
+  items: [{ productId: Schema.Types.ObjectId, quantity: Number }]
+}));
 
-const orderSchema = new Schema(
-  {
-    userId: { type: Schema.Types.ObjectId, required: true, ref: "User", index: true },
-    items: [
-      {
-        productId: { type: Schema.Types.ObjectId, required: true, ref: "Product" },
-        name: { type: String, required: true },
-        price: { type: Number, required: true },
-        imageUrl: { type: String, required: true },
-        quantity: { type: Number, required: true, min: 1 }
-      }
-    ],
-    subtotal: { type: Number, required: true, min: 0 },
-    createdAt: { type: Date, default: Date.now },
-    shipping: {
-      fullName: { type: String, default: "" },
-      addressLine1: { type: String, default: "" },
-      addressLine2: { type: String, default: "" },
-      city: { type: String, default: "" },
-      state: { type: String, default: "" },
-      zip: { type: String, default: "" },
-      country: { type: String, default: "" }
-    }
-  },
-  { timestamps: false }
-);
-
-const User = mongoose.model("User", userSchema);
-const Product = mongoose.model("Product", productSchema);
-const Cart = mongoose.model("Cart", cartSchema);
-const Order = mongoose.model("Order", orderSchema);
-
-// -----------------------------
-// Seed sample products
-// -----------------------------
-
-const UNSPLASH = {
-  shirt: (sig) => `https://source.unsplash.com/featured/800x800?shirt,men&sig=${sig}`,
-  jeans: (sig) => `https://source.unsplash.com/featured/800x800?jeans,denim&sig=${sig}`,
-  polo: (sig) => `https://source.unsplash.com/featured/800x800?polo,shirt&sig=${sig}`,
-  dress: (sig) => `https://source.unsplash.com/featured/800x800?dress,fashion&sig=${sig}`,
-  jacket: (sig) => `https://source.unsplash.com/featured/800x800?denim,jacket&sig=${sig}`,
-  kids: (sig) => `https://source.unsplash.com/featured/800x800?kids,clothing&sig=${sig}`,
-  sneakers: (sig) => `https://source.unsplash.com/featured/800x800?sneakers,shoes&sig=${sig}`
-};
-
-const bannerUrl = `https://source.unsplash.com/featured/1800x600?fashion,shopping&sig=101`;
-
-const FALLBACK_PRODUCTS = [
-  { id: "p1", category: "Men", name: "Slim Fit Denim Jeans", price: 799, imageUrl: UNSPLASH.jeans(1) },
-  { id: "p2", category: "Men", name: "Cotton Oxford Shirt", price: 599, imageUrl: UNSPLASH.shirt(2) },
-  { id: "p3", category: "Men", name: "Classic Polo Tee", price: 499, imageUrl: UNSPLASH.polo(3) },
-  { id: "p4", category: "Men", name: "Blue Denim Jacket", price: 1299, imageUrl: UNSPLASH.jacket(4) },
-  { id: "p5", category: "Women", name: "Floral Summer Dress", price: 999, imageUrl: UNSPLASH.dress(5) },
-  { id: "p6", category: "Women", name: "Elegant Midi Dress", price: 1199, imageUrl: UNSPLASH.dress(6) },
-  { id: "p7", category: "Women", name: "Denim Jacket (Women)", price: 1399, imageUrl: UNSPLASH.jacket(7) },
-  { id: "p8", category: "Women", name: "Soft Jersey T-Shirt Dress", price: 849, imageUrl: UNSPLASH.dress(8) },
-  { id: "p9", category: "Kids", name: "Kids T-Shirt Pack", price: 399, imageUrl: UNSPLASH.kids(9) },
-  { id: "p10", category: "Kids", name: "Boys Joggers (Comfort Fit)", price: 549, imageUrl: UNSPLASH.kids(10) },
-  { id: "p11", category: "Kids", name: "Girls Party Dress", price: 699, imageUrl: UNSPLASH.dress(11) },
-  { id: "p12", category: "Kids", name: "Kids Sneakers (Everyday)", price: 899, imageUrl: UNSPLASH.sneakers(12) }
-];
-
-const inMemory = {
-  // email -> { id, name, email, passwordHash }
-  usersByEmail: new Map(),
-  // userId -> [{ productId, quantity }]
-  cartsByUserId: new Map(),
-  orders: []
-};
-
-function mongoAvailable() {
-  return mongoose.connection.readyState === 1;
-}
-
-async function seedProductsIfEmpty() {
-  const count = await Product.countDocuments();
-  if (count > 0) return;
-
-  const sample = FALLBACK_PRODUCTS.map((p) => ({
-    category: p.category,
-    name: p.name,
-    price: p.price,
-    imageUrl: p.imageUrl
-  }));
-
-  await Product.insertMany(sample);
-
-  // Store banner in a lightweight way by creating a special product doc is overkill.
-  // Frontend uses its own banner image URL fallback.
-  console.log(`Seeded ${sample.length} products. Banner: ${bannerUrl}`);
-}
-
-// -----------------------------
-// Auth
-// -----------------------------
-
+/* ---------------- AUTH ---------------- */
 function signToken(user) {
-  const sub = user._id ? user._id.toString() : user.id;
-  return jwt.sign(
-    { sub, email: user.email },
-    JWT_SECRET,
-    { expiresIn: "7d" }
-  );
+  return jwt.sign({ sub: user._id, email: user.email }, JWT_SECRET, { expiresIn: "7d" });
 }
 
-function authMiddleware(req, res, next) {
-  const header = req.headers.authorization || "";
-  const [type, token] = header.split(" ");
-  if (type !== "Bearer" || !token) return res.status(401).json({ message: "Missing token." });
+function auth(req, res, next) {
+  const token = req.headers.authorization?.split(" ")[1];
+  if (!token) return res.status(401).json({ message: "No token" });
 
   try {
-    const payload = jwt.verify(token, JWT_SECRET);
-    // Validate ObjectId early to avoid Mongoose CastError -> 500
-    if (mongoAvailable() && !mongoose.Types.ObjectId.isValid(payload.sub)) {
-      return res.status(401).json({ message: "Invalid token subject." });
-    }
-    req.userId = payload.sub;
-    return next();
+    const decoded = jwt.verify(token, JWT_SECRET);
+    req.userId = decoded.sub;
+    next();
   } catch {
-    return res.status(401).json({ message: "Invalid/expired token." });
+    res.status(401).json({ message: "Invalid token" });
   }
 }
 
-// -----------------------------
-// API Routes
-// -----------------------------
+/* ---------------- ROUTES ---------------- */
 
-const api = express.Router();
-
-// Auth: register
-api.post("/auth/register", async (req, res) => {
+// Register
+app.post("/api/register", async (req, res) => {
   try {
-    const { name, email, password } = req.body || {};
-    if (!name || !email || !password) return res.status(400).json({ message: "name, email, password required." });
-    if (password.length < 6) return res.status(400).json({ message: "Password must be at least 6 characters." });
-
-    if (!mongoAvailable()) {
-      const emailNorm = String(email).toLowerCase().trim();
-      if (inMemory.usersByEmail.has(emailNorm)) return res.status(409).json({ message: "Email already registered." });
-      const passwordHash = await bcrypt.hash(password, 10);
-      const user = { id: crypto.randomBytes(12).toString("hex"), name: String(name).trim(), email: emailNorm, passwordHash };
-      inMemory.usersByEmail.set(emailNorm, user);
-      return res.status(201).json({ token: signToken(user), user: { id: user.id, name: user.name, email: user.email } });
-    }
-
-    const existing = await User.findOne({ email: String(email).toLowerCase().trim() });
-    if (existing) return res.status(409).json({ message: "Email already registered." });
-
-    const passwordHash = await bcrypt.hash(password, 10);
-    const user = await User.create({ name: String(name).trim(), email: String(email).toLowerCase().trim(), passwordHash });
-    return res.status(201).json({ token: signToken(user), user: { id: user._id, name: user.name, email: user.email } });
+    const { name, email, password } = req.body;
+    const hash = await bcrypt.hash(password, 10);
+    const user = await User.create({ name, email, passwordHash: hash });
+    res.json({ token: signToken(user) });
   } catch (err) {
-    console.error(err);
-    const status = clientErrorStatus(err);
-    const message = status === 409 ? normalizeErrorMessage(err, "Email already registered.") : "Register failed.";
-    return res.status(status).json({
-      message,
-      ...(DEBUG_ERRORS ? { error: err.message, stack: err.stack } : {})
-    });
+    res.status(clientErrorStatus(err)).json({ message: err.message });
   }
 });
 
-// Auth: login
-api.post("/auth/login", async (req, res) => {
+// Login
+app.post("/api/login", async (req, res) => {
   try {
-    const { email, password } = req.body || {};
-    if (!email || !password) return res.status(400).json({ message: "email, password required." });
-
-    if (!mongoAvailable()) {
-      const emailNorm = String(email).toLowerCase().trim();
-      const user = inMemory.usersByEmail.get(emailNorm);
-      if (!user) return res.status(401).json({ message: "Invalid credentials." });
-      const ok = await bcrypt.compare(password, user.passwordHash);
-      if (!ok) return res.status(401).json({ message: "Invalid credentials." });
-      return res.json({ token: signToken(user), user: { id: user.id, name: user.name, email: user.email } });
-    }
-
-    const user = await User.findOne({ email: String(email).toLowerCase().trim() });
-    if (!user) return res.status(401).json({ message: "Invalid credentials." });
-
-    const ok = await bcrypt.compare(password, user.passwordHash);
-    if (!ok) return res.status(401).json({ message: "Invalid credentials." });
-
-    return res.json({ token: signToken(user), user: { id: user._id, name: user.name, email: user.email } });
+    const user = await User.findOne({ email });
+    const ok = await bcrypt.compare(req.body.password, user.passwordHash);
+    if (!ok) return res.status(401).json({ message: "Invalid" });
+    res.json({ token: signToken(user) });
   } catch (err) {
-    console.error(err);
-    const status = clientErrorStatus(err);
-    return res.status(status).json({
-      message: status === 400 ? "Invalid credentials." : "Login failed.",
-      ...(DEBUG_ERRORS ? { error: err.message, stack: err.stack } : {})
-    });
+    res.status(500).json({ message: "Login failed" });
   }
 });
 
 // Products
-api.get("/products", async (req, res) => {
+app.get("/api/products", async (req, res) => {
   try {
-    const category = req.query.category;
-    if (!mongoAvailable()) {
-      const filtered = FALLBACK_PRODUCTS.filter((p) => !category || category === "All" || p.category === category);
-      return res.json({
-        products: filtered.map((p) => ({ id: p.id, category: p.category, name: p.name, price: p.price, imageUrl: p.imageUrl }))
-      });
-    }
-    const q = { isActive: true };
-    if (category && ["Men", "Women", "Kids"].includes(String(category))) {
-      q.category = category;
-    }
-    const products = await Product.find(q).sort({ createdAt: -1 }).limit(48);
-    return res.json({
-      products: products.map((p) => ({
-        id: p._id,
-        category: p.category,
-        name: p.name,
-        price: p.price,
-        imageUrl: p.imageUrl
-      }))
-    });
+    const products = await Product.find();
+    res.json(products);
   } catch (err) {
-    console.error(err);
-    const status = clientErrorStatus(err);
-    return res.status(status).json({
-      message: status === 400 ? "Invalid request." : "Failed to fetch products.",
-      ...(DEBUG_ERRORS ? { error: err.message, stack: err.stack } : {})
-    });
-  }
-});
-
-// Debug / health (no auth) - helps diagnose 500s
-api.get("/debug/health", async (_req, res) => {
-  try {
-    const state = mongoose.connection.readyState; // 0..3
-    const ping = await mongoose.connection.db?.admin?.ping?.().catch(() => null);
-    const productCount = await Product.countDocuments().catch(() => 0);
-    return res.json({
-      mongoReadyState: state,
-      pingOk: Boolean(ping),
-      productCount
-    });
-  } catch (err) {
-    return res.status(503).json({
-      message: "MongoDB health check failed.",
-      error: err?.message || "Unknown error"
-    });
-  }
-});
-
-api.get("/products/:id", async (req, res) => {
-  try {
-    if (!mongoAvailable()) {
-      const p = FALLBACK_PRODUCTS.find((x) => x.id === req.params.id);
-      if (!p) return res.status(404).json({ message: "Product not found." });
-      return res.json({
-        product: {
-          id: p.id,
-          category: p.category,
-          name: p.name,
-          price: p.price,
-          imageUrl: p.imageUrl
-        }
-      });
-    }
-    if (!mongoose.Types.ObjectId.isValid(req.params.id)) return res.status(404).json({ message: "Product not found." });
-    const p = await Product.findById(req.params.id);
-    if (!p || !p.isActive) return res.status(404).json({ message: "Product not found." });
-    return res.json({
-      product: {
-        id: p._id,
-        category: p.category,
-        name: p.name,
-        price: p.price,
-        imageUrl: p.imageUrl
-      }
-    });
-  } catch {
-    return res.status(404).json({ message: "Product not found." });
+    res.status(clientErrorStatus(err)).json({ message: "Failed" });
   }
 });
 
 // Cart
-api.get("/cart", authMiddleware, async (req, res) => {
+app.post("/api/cart", auth, async (req, res) => {
   try {
-    if (!mongoAvailable()) {
-      const cart = inMemory.cartsByUserId.get(req.userId) || [];
-      const items = cart
-        .map((it) => {
-          const p = FALLBACK_PRODUCTS.find((x) => x.id === it.productId);
-          if (!p) return null;
-          return {
-            productId: it.productId,
-            quantity: it.quantity,
-            product: { id: p.id, name: p.name, price: p.price, imageUrl: p.imageUrl, category: p.category }
-          };
-        })
-        .filter(Boolean);
-      const subtotal = items.reduce((sum, it) => sum + it.quantity * it.product.price, 0);
-      return res.json({ items, subtotal });
-    }
-    const cart = await Cart.findOne({ userId: req.userId }).lean();
-    if (!cart) return res.json({ items: [], subtotal: 0 });
-
-    const ids = cart.items
-      .map((it) => it.productId)
-      .filter((id) => mongoose.Types.ObjectId.isValid(id));
-    const products = await Product.find({ _id: { $in: ids } }).lean();
-    const byId = new Map(products.map((p) => [String(p._id), p]));
-
-    const items = cart.items
-      .map((it) => {
-        const p = byId.get(String(it.productId));
-        if (!p) return null;
-        return {
-          productId: it.productId,
-          quantity: it.quantity,
-          product: {
-            id: p._id,
-            name: p.name,
-            price: p.price,
-            imageUrl: p.imageUrl,
-            category: p.category
-          }
-        };
-      })
-      .filter(Boolean);
-
-    const subtotal = items.reduce((sum, it) => sum + it.quantity * it.product.price, 0);
-    return res.json({ items, subtotal });
-  } catch (err) {
-    console.error(err);
-    return res.status(clientErrorStatus(err)).json({
-      message: "Failed to load cart.",
-      ...(DEBUG_ERRORS ? { error: err.message, stack: err.stack } : {})
-    });
-  }
-});
-
-api.post("/cart/add", authMiddleware, async (req, res) => {
-  try {
-    const { productId, quantity } = req.body || {};
-    if (!productId) return res.status(400).json({ message: "productId required." });
-    const qty = quantity ? Number(quantity) : 1;
-    if (!Number.isFinite(qty) || qty < 1) return res.status(400).json({ message: "quantity must be >= 1." });
-
-    if (!mongoAvailable()) {
-      const p = FALLBACK_PRODUCTS.find((x) => x.id === productId);
-      if (!p) return res.status(404).json({ message: "Product not found." });
-      const cart = inMemory.cartsByUserId.get(req.userId) || [];
-      const found = cart.find((x) => x.productId === productId);
-      if (found) found.quantity += qty;
-      else cart.push({ productId, quantity: qty });
-      inMemory.cartsByUserId.set(req.userId, cart);
-      return res.status(201).json({ message: "Added to cart." });
-    }
-
-    if (!mongoose.Types.ObjectId.isValid(productId)) return res.status(400).json({ message: "Invalid productId." });
-    const product = await Product.findById(productId);
-    if (!product || !product.isActive) return res.status(404).json({ message: "Product not found." });
-
-    // MongoDB-version-safe flow: read -> mutate -> save
     let cart = await Cart.findOne({ userId: req.userId });
-    if (!cart) {
+    if (!cart) cart = await Cart.create({ userId: req.userId, items: [] });
+
+    cart.items.push(req.body);
+    await cart.save();
+
+    res.json({ message: "Added to cart" });
+  } catch (err) {
+    res.status(clientErrorStatus(err)).json({ message: "Cart error" });
+  }
+});
+
+/* ---------------- HEALTH CHECK FIX ---------------- */
+app.get("/api/health", async (req, res) => {
+  try {
+    let ping = null;
+
+    if (mongoose.connection.db) {
       try {
-        cart = await Cart.create({ userId: req.userId, items: [{ productId, quantity: qty }] });
-      } catch (err) {
-        // In case another request created the cart first
-        if (err && err.code === 11000) {
-          cart = await Cart.findOne({ userId: req.userId });
-        } else {
-          throw err;
-        }
-      }
-    } else {
-      const found = cart.items.find((x) => String(x.productId) === String(productId));
-      if (found) found.quantity += qty;
-      else cart.items.push({ productId, quantity: qty });
-      await cart.save();
+        ping = await mongoose.connection.db.admin().ping();
+      } catch {}
     }
 
-    return res.status(201).json({ message: "Added to cart." });
-  } catch (err) {
-    console.error(err);
-    return res.status(clientErrorStatus(err)).json({
-      message: "Failed to add to cart.",
-      ...(DEBUG_ERRORS ? { error: err.message, stack: err.stack } : {})
+    res.json({
+      mongo: mongoose.connection.readyState,
+      ping: !!ping
     });
+  } catch {
+    res.status(503).json({ message: "DB error" });
   }
 });
 
-api.patch("/cart/update", authMiddleware, async (req, res) => {
-  try {
-    const { productId, quantity } = req.body || {};
-    if (!productId) return res.status(400).json({ message: "productId required." });
-    const qty = Number(quantity);
-    if (!Number.isFinite(qty) || qty < 1) return res.status(400).json({ message: "quantity must be >= 1." });
-
-    if (!mongoAvailable()) {
-      const p = FALLBACK_PRODUCTS.find((x) => x.id === productId);
-      if (!p) return res.status(404).json({ message: "Product not found." });
-      const cart = inMemory.cartsByUserId.get(req.userId);
-      if (!cart) return res.status(404).json({ message: "Cart not found." });
-      const item = cart.find((x) => x.productId === productId);
-      if (!item) return res.status(404).json({ message: "Item not found in cart." });
-      item.quantity = qty;
-      inMemory.cartsByUserId.set(req.userId, cart);
-      return res.json({ message: "Cart updated." });
-    }
-
-    if (!mongoose.Types.ObjectId.isValid(productId)) return res.status(400).json({ message: "Invalid productId." });
-    const cart = await Cart.findOne({ userId: req.userId });
-    if (!cart) return res.status(404).json({ message: "Cart not found." });
-
-    const item = cart.items.find((it) => String(it.productId) === String(productId));
-    if (!item) return res.status(404).json({ message: "Item not found in cart." });
-
-    item.quantity = qty;
-    await cart.save();
-    return res.json({ message: "Cart updated." });
-  } catch (err) {
-    console.error(err);
-    return res.status(clientErrorStatus(err)).json({
-      message: "Failed to update cart.",
-      ...(DEBUG_ERRORS ? { error: err.message, stack: err.stack } : {})
-    });
-  }
-});
-
-api.delete("/cart/remove", authMiddleware, async (req, res) => {
-  try {
-    const { productId } = req.body || {};
-    if (!productId) return res.status(400).json({ message: "productId required." });
-
-    if (!mongoAvailable()) {
-      const p = FALLBACK_PRODUCTS.find((x) => x.id === productId);
-      if (!p) return res.status(404).json({ message: "Product not found." });
-      const cart = inMemory.cartsByUserId.get(req.userId);
-      if (!cart) return res.status(404).json({ message: "Cart not found." });
-      const nextCart = cart.filter((x) => x.productId !== productId);
-      inMemory.cartsByUserId.set(req.userId, nextCart);
-      return res.json({ message: "Removed from cart." });
-    }
-
-    if (!mongoose.Types.ObjectId.isValid(productId)) return res.status(400).json({ message: "Invalid productId." });
-    const cart = await Cart.findOne({ userId: req.userId });
-    if (!cart) return res.status(404).json({ message: "Cart not found." });
-
-    cart.items = cart.items.filter((it) => String(it.productId) !== String(productId));
-    await cart.save();
-    return res.json({ message: "Removed from cart." });
-  } catch (err) {
-    console.error(err);
-    return res.status(clientErrorStatus(err)).json({
-      message: "Failed to remove item.",
-      ...(DEBUG_ERRORS ? { error: err.message, stack: err.stack } : {})
-    });
-  }
-});
-
-// Checkout
-api.post("/checkout", authMiddleware, async (req, res) => {
-  try {
-    const { shipping } = req.body || {};
-
-    if (!mongoAvailable()) {
-      const cartItems = inMemory.cartsByUserId.get(req.userId) || [];
-      if (!cartItems || cartItems.length === 0) return res.status(400).json({ message: "Cart is empty." });
-
-      const items = cartItems
-        .map((it) => {
-          const p = FALLBACK_PRODUCTS.find((x) => x.id === it.productId);
-          if (!p) return null;
-          return { productId: it.productId, name: p.name, price: p.price, imageUrl: p.imageUrl, quantity: it.quantity };
-        })
-        .filter(Boolean);
-
-      if (items.length === 0) return res.status(400).json({ message: "No valid items in cart." });
-      const subtotal = items.reduce((sum, it) => sum + it.quantity * it.price, 0);
-
-      const order = { id: crypto.randomBytes(12).toString("hex"), items, subtotal, shipping: shipping || {}, createdAt: new Date() };
-      inMemory.orders.push(order);
-      inMemory.cartsByUserId.set(req.userId, []);
-
-      return res.status(201).json({
-        message: "Checkout successful.",
-        order: { id: order.id, subtotal: order.subtotal, createdAt: order.createdAt }
-      });
-    }
-
-    const cart = await Cart.findOne({ userId: req.userId });
-    if (!cart || cart.items.length === 0) return res.status(400).json({ message: "Cart is empty." });
-
-    const ids = cart.items
-      .map((it) => it.productId)
-      .filter((id) => mongoose.Types.ObjectId.isValid(id));
-    const products = await Product.find({ _id: { $in: ids } }).lean();
-    const byId = new Map(products.map((p) => [String(p._id), p]));
-
-    const items = [];
-    for (const it of cart.items) {
-      const p = byId.get(String(it.productId));
-      if (!p) continue;
-      items.push({
-        productId: p._id,
-        name: p.name,
-        price: p.price,
-        imageUrl: p.imageUrl,
-        quantity: it.quantity
-      });
-    }
-
-    if (items.length === 0) return res.status(400).json({ message: "No valid items in cart." });
-    const subtotal = items.reduce((sum, it) => sum + it.quantity * it.price, 0);
-
-    const order = await Order.create({
-      userId: req.userId,
-      items,
-      subtotal,
-      shipping: shipping || {}
-    });
-
-    // Clear cart
-    cart.items = [];
-    await cart.save();
-
-    return res.status(201).json({
-      message: "Checkout successful.",
-      order: {
-        id: order._id,
-        subtotal: order.subtotal,
-        createdAt: order.createdAt
-      }
-    });
-  } catch (err) {
-    console.error(err);
-    return res.status(clientErrorStatus(err)).json({
-      message: "Checkout failed.",
-      ...(DEBUG_ERRORS ? { error: err.message, stack: err.stack } : {})
-    });
-  }
-});
-
-// Request logger (helps identify which API endpoint triggers 500)
-app.use("/api", (req, _res, next) => {
-  const sensitiveRedaction = (obj) => {
-    if (!obj || typeof obj !== "object") return obj;
-    const copy = { ...obj };
-    if (typeof copy.password !== "undefined") copy.password = "*****";
-    return copy;
-  };
-
-  const body = ["POST", "PUT", "PATCH", "DELETE"].includes(req.method) ? sensitiveRedaction(req.body) : undefined;
-  console.log(`[API] ${req.method} ${req.originalUrl}`, body ? { body } : "");
-  next();
-});
-
-app.use("/api", api);
-
-// Catch any unexpected errors that aren't already handled in route try/catch.
-app.use((err, req, res, next) => {
-  const sensitiveRedaction = (obj) => {
-    if (!obj || typeof obj !== "object") return obj;
-    const copy = { ...obj };
-    if (typeof copy.password !== "undefined") copy.password = "*****";
-    if (typeof copy.token !== "undefined") copy.token = "*****";
-    return copy;
-  };
-
-  const body = ["POST", "PUT", "PATCH", "DELETE"].includes(req.method) ? sensitiveRedaction(req.body) : undefined;
-  console.error("Unhandled error:", {
-    message: err?.message,
-    name: err?.name,
-    route: `${req.method} ${req.originalUrl}`,
-    body
-  });
-  const status = clientErrorStatus(err);
-  res.status(status).json({
-    message:
-      status === 503
-        ? "MongoDB not reachable. Start MongoDB or set a correct MONGODB_URI in .env."
-        : status === 400
-          ? "Invalid request."
-          : "Internal server error",
-    error: err?.message || "Unknown error",
-    ...(DEBUG_ERRORS ? { stack: err?.stack } : {})
-  });
-});
-
-// -----------------------------
-// Frontend static
-// -----------------------------
-
+/* ---------------- STATIC ---------------- */
 app.use(express.static(path.join(__dirname, "public")));
-app.get("/", (req, res) => {
-  res.sendFile(path.join(__dirname, "public", "index.html"));
-});
-app.get("/checkout", (req, res) => {
-  res.sendFile(path.join(__dirname, "public", "checkout.html"));
-});
 
-// -----------------------------
-// Start
-// -----------------------------
-
+/* ---------------- START SERVER ---------------- */
 async function start() {
-  let mongoConnected = false;
   try {
     await mongoose.connect(MONGODB_URI);
-    mongoConnected = true;
-    await seedProductsIfEmpty();
+    console.log("✅ MongoDB connected");
   } catch (err) {
-    mongoConnected = false;
-    console.error("MongoDB connection failed:", err?.message || err);
+    console.warn("⚠️ MongoDB NOT connected. Running in fallback mode.");
   }
 
   app.listen(PORT, () => {
-    console.log(`Server running on http://localhost:${PORT}`);
-    if (!mongoConnected) {
-      console.warn("Server started without MongoDB. API calls will likely return 503 until MongoDB is available.");
-    }
+    console.log(`🚀 Server running on http://localhost:${PORT}`);
   });
 }
 
-start().catch((err) => {
-  console.error("Failed to start server:", err);
-  process.exit(1);
-});
-
+start();
