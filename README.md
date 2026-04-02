@@ -28,6 +28,11 @@ This is a complete clothing shopping website with:
 2. Open:
    - `http://localhost:3000`
 
+## Quick diagnostics (if you see 500 errors)
+Run these in PowerShell to see the real API response:
+1. `Invoke-RestMethod http://localhost:3000/api/debug/health`
+2. `Invoke-RestMethod http://localhost:3000/api/products`
+
 ## Notes
 - Product images are loaded from free Unsplash image endpoints (real image URLs).
 - Checkout places an order into MongoDB (no payment integration).

@@ -311,6 +311,25 @@ api.get("/products", async (req, res) => {
   }
 });
 
+// Debug / health (no auth) - helps diagnose 500s
+api.get("/debug/health", async (_req, res) => {
+  try {
+    const state = mongoose.connection.readyState; // 0..3
+    const ping = await mongoose.connection.db?.admin?.ping?.().catch(() => null);
+    const productCount = await Product.countDocuments().catch(() => 0);
+    return res.json({
+      mongoReadyState: state,
+      pingOk: Boolean(ping),
+      productCount
+    });
+  } catch (err) {
+    return res.status(503).json({
+      message: "MongoDB health check failed.",
+      error: err?.message || "Unknown error"
+    });
+  }
+});
+
 api.get("/products/:id", async (req, res) => {
   try {
     if (!mongoose.Types.ObjectId.isValid(req.params.id)) return res.status(404).json({ message: "Product not found." });
