@@ -20,9 +20,46 @@ app.use(express.json());
 app.use(cors());
 app.use(morgan("dev"));
 
+// Log unhandled issues so we can diagnose 500s quickly.
+process.on("unhandledRejection", (reason) => {
+  console.error("Unhandled promise rejection:", reason);
+});
+process.on("uncaughtException", (err) => {
+  console.error("Uncaught exception:", err);
+});
+
 const PORT = process.env.PORT || 3000;
+const NODE_ENV = process.env.NODE_ENV || "development";
+const DEBUG_ERRORS = NODE_ENV !== "production";
 const MONGODB_URI = process.env.MONGODB_URI;
 const JWT_SECRET = process.env.JWT_SECRET;
+
+function clientErrorStatus(err) {
+  if (!err) return 500;
+  if (err.name === "CastError") return 400;
+  if (err.name === "ValidationError") return 400;
+  if (err.code === 11000) return 409; // Mongo duplicate key
+  // Common Mongo connection failures should not look like "Internal server error"
+  const msg = typeof err.message === "string" ? err.message.toLowerCase() : "";
+  if (
+    err.name === "MongooseServerSelectionError" ||
+    err.name === "MongoNetworkError" ||
+    err.name === "MongoServerError" && msg.includes("failed to connect")
+  ) {
+    return 503;
+  }
+  if (msg.includes("econnrefused") || msg.includes("connection refused") || msg.includes("failed to connect")) return 503;
+  // Some Mongoose cast failures come with these shapes too.
+  if (typeof err.message === "string" && err.message.toLowerCase().includes("cast to")) return 400;
+  if (typeof err.message === "string" && err.message.toLowerCase().includes("objectid")) return 400;
+  return 500;
+}
+
+function normalizeErrorMessage(err, fallback) {
+  if (!err) return fallback;
+  if (err.code === 11000) return "Email already registered.";
+  return err.message || fallback;
+}
 
 if (!MONGODB_URI) {
   console.error("Missing MONGODB_URI in environment.");
@@ -169,6 +206,10 @@ function authMiddleware(req, res, next) {
 
   try {
     const payload = jwt.verify(token, JWT_SECRET);
+    // Validate ObjectId early to avoid Mongoose CastError -> 500
+    if (!mongoose.Types.ObjectId.isValid(payload.sub)) {
+      return res.status(401).json({ message: "Invalid token subject." });
+    }
     req.userId = payload.sub;
     return next();
   } catch {
@@ -197,7 +238,12 @@ api.post("/auth/register", async (req, res) => {
     return res.status(201).json({ token: signToken(user), user: { id: user._id, name: user.name, email: user.email } });
   } catch (err) {
     console.error(err);
-    return res.status(500).json({ message: "Register failed." });
+    const status = clientErrorStatus(err);
+    const message = status === 409 ? normalizeErrorMessage(err, "Email already registered.") : "Register failed.";
+    return res.status(status).json({
+      message,
+      ...(DEBUG_ERRORS ? { error: err.message, stack: err.stack } : {})
+    });
   }
 });
 
@@ -216,7 +262,11 @@ api.post("/auth/login", async (req, res) => {
     return res.json({ token: signToken(user), user: { id: user._id, name: user.name, email: user.email } });
   } catch (err) {
     console.error(err);
-    return res.status(500).json({ message: "Login failed." });
+    const status = clientErrorStatus(err);
+    return res.status(status).json({
+      message: status === 400 ? "Invalid credentials." : "Login failed.",
+      ...(DEBUG_ERRORS ? { error: err.message, stack: err.stack } : {})
+    });
   }
 });
 
@@ -240,12 +290,17 @@ api.get("/products", async (req, res) => {
     });
   } catch (err) {
     console.error(err);
-    return res.status(500).json({ message: "Failed to fetch products." });
+    const status = clientErrorStatus(err);
+    return res.status(status).json({
+      message: status === 400 ? "Invalid request." : "Failed to fetch products.",
+      ...(DEBUG_ERRORS ? { error: err.message, stack: err.stack } : {})
+    });
   }
 });
 
 api.get("/products/:id", async (req, res) => {
   try {
+    if (!mongoose.Types.ObjectId.isValid(req.params.id)) return res.status(404).json({ message: "Product not found." });
     const p = await Product.findById(req.params.id);
     if (!p || !p.isActive) return res.status(404).json({ message: "Product not found." });
     return res.json({
@@ -268,7 +323,9 @@ api.get("/cart", authMiddleware, async (req, res) => {
     const cart = await Cart.findOne({ userId: req.userId }).lean();
     if (!cart) return res.json({ items: [], subtotal: 0 });
 
-    const ids = cart.items.map((it) => it.productId);
+    const ids = cart.items
+      .map((it) => it.productId)
+      .filter((id) => mongoose.Types.ObjectId.isValid(id));
     const products = await Product.find({ _id: { $in: ids } }).lean();
     const byId = new Map(products.map((p) => [String(p._id), p]));
 
@@ -294,7 +351,10 @@ api.get("/cart", authMiddleware, async (req, res) => {
     return res.json({ items, subtotal });
   } catch (err) {
     console.error(err);
-    return res.status(500).json({ message: "Failed to load cart." });
+    return res.status(clientErrorStatus(err)).json({
+      message: "Failed to load cart.",
+      ...(DEBUG_ERRORS ? { error: err.message, stack: err.stack } : {})
+    });
   }
 });
 
@@ -302,6 +362,7 @@ api.post("/cart/add", authMiddleware, async (req, res) => {
   try {
     const { productId, quantity } = req.body || {};
     if (!productId) return res.status(400).json({ message: "productId required." });
+    if (!mongoose.Types.ObjectId.isValid(productId)) return res.status(400).json({ message: "Invalid productId." });
     const qty = quantity ? Number(quantity) : 1;
     if (!Number.isFinite(qty) || qty < 1) return res.status(400).json({ message: "quantity must be >= 1." });
 
@@ -311,7 +372,16 @@ api.post("/cart/add", authMiddleware, async (req, res) => {
     // MongoDB-version-safe flow: read -> mutate -> save
     let cart = await Cart.findOne({ userId: req.userId });
     if (!cart) {
-      cart = await Cart.create({ userId: req.userId, items: [{ productId, quantity: qty }] });
+      try {
+        cart = await Cart.create({ userId: req.userId, items: [{ productId, quantity: qty }] });
+      } catch (err) {
+        // In case another request created the cart first
+        if (err && err.code === 11000) {
+          cart = await Cart.findOne({ userId: req.userId });
+        } else {
+          throw err;
+        }
+      }
     } else {
       const found = cart.items.find((x) => String(x.productId) === String(productId));
       if (found) found.quantity += qty;
@@ -322,7 +392,10 @@ api.post("/cart/add", authMiddleware, async (req, res) => {
     return res.status(201).json({ message: "Added to cart." });
   } catch (err) {
     console.error(err);
-    return res.status(500).json({ message: "Failed to add to cart." });
+    return res.status(clientErrorStatus(err)).json({
+      message: "Failed to add to cart.",
+      ...(DEBUG_ERRORS ? { error: err.message, stack: err.stack } : {})
+    });
   }
 });
 
@@ -330,6 +403,7 @@ api.patch("/cart/update", authMiddleware, async (req, res) => {
   try {
     const { productId, quantity } = req.body || {};
     if (!productId) return res.status(400).json({ message: "productId required." });
+    if (!mongoose.Types.ObjectId.isValid(productId)) return res.status(400).json({ message: "Invalid productId." });
     const qty = Number(quantity);
     if (!Number.isFinite(qty) || qty < 1) return res.status(400).json({ message: "quantity must be >= 1." });
 
@@ -344,7 +418,10 @@ api.patch("/cart/update", authMiddleware, async (req, res) => {
     return res.json({ message: "Cart updated." });
   } catch (err) {
     console.error(err);
-    return res.status(500).json({ message: "Failed to update cart." });
+    return res.status(clientErrorStatus(err)).json({
+      message: "Failed to update cart.",
+      ...(DEBUG_ERRORS ? { error: err.message, stack: err.stack } : {})
+    });
   }
 });
 
@@ -352,6 +429,7 @@ api.delete("/cart/remove", authMiddleware, async (req, res) => {
   try {
     const { productId } = req.body || {};
     if (!productId) return res.status(400).json({ message: "productId required." });
+    if (!mongoose.Types.ObjectId.isValid(productId)) return res.status(400).json({ message: "Invalid productId." });
 
     const cart = await Cart.findOne({ userId: req.userId });
     if (!cart) return res.status(404).json({ message: "Cart not found." });
@@ -361,7 +439,10 @@ api.delete("/cart/remove", authMiddleware, async (req, res) => {
     return res.json({ message: "Removed from cart." });
   } catch (err) {
     console.error(err);
-    return res.status(500).json({ message: "Failed to remove item." });
+    return res.status(clientErrorStatus(err)).json({
+      message: "Failed to remove item.",
+      ...(DEBUG_ERRORS ? { error: err.message, stack: err.stack } : {})
+    });
   }
 });
 
@@ -373,7 +454,9 @@ api.post("/checkout", authMiddleware, async (req, res) => {
     const cart = await Cart.findOne({ userId: req.userId });
     if (!cart || cart.items.length === 0) return res.status(400).json({ message: "Cart is empty." });
 
-    const ids = cart.items.map((it) => it.productId);
+    const ids = cart.items
+      .map((it) => it.productId)
+      .filter((id) => mongoose.Types.ObjectId.isValid(id));
     const products = await Product.find({ _id: { $in: ids } }).lean();
     const byId = new Map(products.map((p) => [String(p._id), p]));
 
@@ -414,11 +497,58 @@ api.post("/checkout", authMiddleware, async (req, res) => {
     });
   } catch (err) {
     console.error(err);
-    return res.status(500).json({ message: "Checkout failed." });
+    return res.status(clientErrorStatus(err)).json({
+      message: "Checkout failed.",
+      ...(DEBUG_ERRORS ? { error: err.message, stack: err.stack } : {})
+    });
   }
 });
 
+// Request logger (helps identify which API endpoint triggers 500)
+app.use("/api", (req, _res, next) => {
+  const sensitiveRedaction = (obj) => {
+    if (!obj || typeof obj !== "object") return obj;
+    const copy = { ...obj };
+    if (typeof copy.password !== "undefined") copy.password = "*****";
+    return copy;
+  };
+
+  const body = ["POST", "PUT", "PATCH", "DELETE"].includes(req.method) ? sensitiveRedaction(req.body) : undefined;
+  console.log(`[API] ${req.method} ${req.originalUrl}`, body ? { body } : "");
+  next();
+});
+
 app.use("/api", api);
+
+// Catch any unexpected errors that aren't already handled in route try/catch.
+app.use((err, req, res, next) => {
+  const sensitiveRedaction = (obj) => {
+    if (!obj || typeof obj !== "object") return obj;
+    const copy = { ...obj };
+    if (typeof copy.password !== "undefined") copy.password = "*****";
+    if (typeof copy.token !== "undefined") copy.token = "*****";
+    return copy;
+  };
+
+  const body = ["POST", "PUT", "PATCH", "DELETE"].includes(req.method) ? sensitiveRedaction(req.body) : undefined;
+  console.error("Unhandled error:", {
+    message: err?.message,
+    name: err?.name,
+    route: `${req.method} ${req.originalUrl}`,
+    body
+  });
+  const status = clientErrorStatus(err);
+  res.status(status).json({
+    message:
+      status === 503
+        ? "MongoDB not reachable. Start MongoDB or set a correct MONGODB_URI in .env."
+        : status === 400
+          ? "Invalid request."
+          : "Internal server error",
+    error: err?.message || "Unknown error",
+    ...(DEBUG_ERRORS ? { stack: err?.stack } : {})
+  });
+});
 
 // -----------------------------
 // Frontend static
