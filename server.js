@@ -31,8 +31,8 @@ process.on("uncaughtException", (err) => {
 const PORT = process.env.PORT || 3000;
 const NODE_ENV = process.env.NODE_ENV || "development";
 const DEBUG_ERRORS = NODE_ENV !== "production";
-const MONGODB_URI = process.env.MONGODB_URI;
-const JWT_SECRET = process.env.JWT_SECRET;
+const MONGODB_URI = process.env.MONGODB_URI || "mongodb://127.0.0.1:27017/clothing_store";
+const JWT_SECRET = process.env.JWT_SECRET || "dev_jwt_secret_change_me";
 
 function clientErrorStatus(err) {
   if (!err) return 500;
@@ -74,14 +74,8 @@ function normalizeErrorMessage(err, fallback) {
   return err.message || fallback;
 }
 
-if (!MONGODB_URI) {
-  console.error("Missing MONGODB_URI in environment.");
-  process.exit(1);
-}
-if (!JWT_SECRET) {
-  console.error("Missing JWT_SECRET in environment.");
-  process.exit(1);
-}
+if (!process.env.MONGODB_URI) console.warn(`MONGODB_URI not set; using default: ${MONGODB_URI}`);
+if (!process.env.JWT_SECRET) console.warn(`JWT_SECRET not set; using default (dev only): ${JWT_SECRET}`);
 
 // -----------------------------
 // Mongo Models
@@ -599,11 +593,21 @@ app.get("/checkout", (req, res) => {
 // -----------------------------
 
 async function start() {
-  await mongoose.connect(MONGODB_URI);
-  await seedProductsIfEmpty();
+  let mongoConnected = false;
+  try {
+    await mongoose.connect(MONGODB_URI);
+    mongoConnected = true;
+    await seedProductsIfEmpty();
+  } catch (err) {
+    mongoConnected = false;
+    console.error("MongoDB connection failed:", err?.message || err);
+  }
 
   app.listen(PORT, () => {
     console.log(`Server running on http://localhost:${PORT}`);
+    if (!mongoConnected) {
+      console.warn("Server started without MongoDB. API calls will likely return 503 until MongoDB is available.");
+    }
   });
 }
 
