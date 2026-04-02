@@ -12,6 +12,7 @@ const morgan = require("morgan");
 const dotenv = require("dotenv");
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
+const crypto = require("crypto");
 
 dotenv.config();
 
@@ -164,26 +165,41 @@ const UNSPLASH = {
 
 const bannerUrl = `https://source.unsplash.com/featured/1800x600?fashion,shopping&sig=101`;
 
+const FALLBACK_PRODUCTS = [
+  { id: "p1", category: "Men", name: "Slim Fit Denim Jeans", price: 799, imageUrl: UNSPLASH.jeans(1) },
+  { id: "p2", category: "Men", name: "Cotton Oxford Shirt", price: 599, imageUrl: UNSPLASH.shirt(2) },
+  { id: "p3", category: "Men", name: "Classic Polo Tee", price: 499, imageUrl: UNSPLASH.polo(3) },
+  { id: "p4", category: "Men", name: "Blue Denim Jacket", price: 1299, imageUrl: UNSPLASH.jacket(4) },
+  { id: "p5", category: "Women", name: "Floral Summer Dress", price: 999, imageUrl: UNSPLASH.dress(5) },
+  { id: "p6", category: "Women", name: "Elegant Midi Dress", price: 1199, imageUrl: UNSPLASH.dress(6) },
+  { id: "p7", category: "Women", name: "Denim Jacket (Women)", price: 1399, imageUrl: UNSPLASH.jacket(7) },
+  { id: "p8", category: "Women", name: "Soft Jersey T-Shirt Dress", price: 849, imageUrl: UNSPLASH.dress(8) },
+  { id: "p9", category: "Kids", name: "Kids T-Shirt Pack", price: 399, imageUrl: UNSPLASH.kids(9) },
+  { id: "p10", category: "Kids", name: "Boys Joggers (Comfort Fit)", price: 549, imageUrl: UNSPLASH.kids(10) },
+  { id: "p11", category: "Kids", name: "Girls Party Dress", price: 699, imageUrl: UNSPLASH.dress(11) },
+  { id: "p12", category: "Kids", name: "Kids Sneakers (Everyday)", price: 899, imageUrl: UNSPLASH.sneakers(12) }
+];
+
+const inMemory = {
+  // email -> { id, name, email, passwordHash }
+  usersByEmail: new Map(),
+  // userId -> [{ productId, quantity }]
+  cartsByUserId: new Map(),
+  orders: []
+};
+
+function mongoAvailable() {
+  return mongoose.connection.readyState === 1;
+}
+
 async function seedProductsIfEmpty() {
   const count = await Product.countDocuments();
   if (count > 0) return;
 
-  const sample = [
-    { category: "Men", name: "Slim Fit Denim Jeans", price: 799, imageUrl: UNSPLASH.jeans(1) },
-    { category: "Men", name: "Cotton Oxford Shirt", price: 599, imageUrl: UNSPLASH.shirt(2) },
-    { category: "Men", name: "Classic Polo Tee", price: 499, imageUrl: UNSPLASH.polo(3) },
-    { category: "Men", name: "Blue Denim Jacket", price: 1299, imageUrl: UNSPLASH.jacket(4) },
-    { category: "Women", name: "Floral Summer Dress", price: 999, imageUrl: UNSPLASH.dress(5) },
-    { category: "Women", name: "Elegant Midi Dress", price: 1199, imageUrl: UNSPLASH.dress(6) },
-    { category: "Women", name: "Denim Jacket (Women)", price: 1399, imageUrl: UNSPLASH.jacket(7) },
-    { category: "Women", name: "Soft Jersey T-Shirt Dress", price: 849, imageUrl: UNSPLASH.dress(8) },
-    { category: "Kids", name: "Kids T-Shirt Pack", price: 399, imageUrl: UNSPLASH.kids(9) },
-    { category: "Kids", name: "Boys Joggers (Comfort Fit)", price: 549, imageUrl: UNSPLASH.kids(10) },
-    { category: "Kids", name: "Girls Party Dress", price: 699, imageUrl: UNSPLASH.dress(11) },
-    { category: "Kids", name: "Kids Sneakers (Everyday)", price: 899, imageUrl: UNSPLASH.sneakers(12) }
-  ].map((p) => ({
-    ...p,
-    // Keep the seed deterministic: set isActive default is fine
+  const sample = FALLBACK_PRODUCTS.map((p) => ({
+    category: p.category,
+    name: p.name,
+    price: p.price,
     imageUrl: p.imageUrl
   }));
 
@@ -199,8 +215,9 @@ async function seedProductsIfEmpty() {
 // -----------------------------
 
 function signToken(user) {
+  const sub = user._id ? user._id.toString() : user.id;
   return jwt.sign(
-    { sub: user._id.toString(), email: user.email },
+    { sub, email: user.email },
     JWT_SECRET,
     { expiresIn: "7d" }
   );
@@ -214,7 +231,7 @@ function authMiddleware(req, res, next) {
   try {
     const payload = jwt.verify(token, JWT_SECRET);
     // Validate ObjectId early to avoid Mongoose CastError -> 500
-    if (!mongoose.Types.ObjectId.isValid(payload.sub)) {
+    if (mongoAvailable() && !mongoose.Types.ObjectId.isValid(payload.sub)) {
       return res.status(401).json({ message: "Invalid token subject." });
     }
     req.userId = payload.sub;
@@ -236,6 +253,15 @@ api.post("/auth/register", async (req, res) => {
     const { name, email, password } = req.body || {};
     if (!name || !email || !password) return res.status(400).json({ message: "name, email, password required." });
     if (password.length < 6) return res.status(400).json({ message: "Password must be at least 6 characters." });
+
+    if (!mongoAvailable()) {
+      const emailNorm = String(email).toLowerCase().trim();
+      if (inMemory.usersByEmail.has(emailNorm)) return res.status(409).json({ message: "Email already registered." });
+      const passwordHash = await bcrypt.hash(password, 10);
+      const user = { id: crypto.randomBytes(12).toString("hex"), name: String(name).trim(), email: emailNorm, passwordHash };
+      inMemory.usersByEmail.set(emailNorm, user);
+      return res.status(201).json({ token: signToken(user), user: { id: user.id, name: user.name, email: user.email } });
+    }
 
     const existing = await User.findOne({ email: String(email).toLowerCase().trim() });
     if (existing) return res.status(409).json({ message: "Email already registered." });
@@ -260,6 +286,15 @@ api.post("/auth/login", async (req, res) => {
     const { email, password } = req.body || {};
     if (!email || !password) return res.status(400).json({ message: "email, password required." });
 
+    if (!mongoAvailable()) {
+      const emailNorm = String(email).toLowerCase().trim();
+      const user = inMemory.usersByEmail.get(emailNorm);
+      if (!user) return res.status(401).json({ message: "Invalid credentials." });
+      const ok = await bcrypt.compare(password, user.passwordHash);
+      if (!ok) return res.status(401).json({ message: "Invalid credentials." });
+      return res.json({ token: signToken(user), user: { id: user.id, name: user.name, email: user.email } });
+    }
+
     const user = await User.findOne({ email: String(email).toLowerCase().trim() });
     if (!user) return res.status(401).json({ message: "Invalid credentials." });
 
@@ -281,6 +316,12 @@ api.post("/auth/login", async (req, res) => {
 api.get("/products", async (req, res) => {
   try {
     const category = req.query.category;
+    if (!mongoAvailable()) {
+      const filtered = FALLBACK_PRODUCTS.filter((p) => !category || category === "All" || p.category === category);
+      return res.json({
+        products: filtered.map((p) => ({ id: p.id, category: p.category, name: p.name, price: p.price, imageUrl: p.imageUrl }))
+      });
+    }
     const q = { isActive: true };
     if (category && ["Men", "Women", "Kids"].includes(String(category))) {
       q.category = category;
@@ -326,6 +367,19 @@ api.get("/debug/health", async (_req, res) => {
 
 api.get("/products/:id", async (req, res) => {
   try {
+    if (!mongoAvailable()) {
+      const p = FALLBACK_PRODUCTS.find((x) => x.id === req.params.id);
+      if (!p) return res.status(404).json({ message: "Product not found." });
+      return res.json({
+        product: {
+          id: p.id,
+          category: p.category,
+          name: p.name,
+          price: p.price,
+          imageUrl: p.imageUrl
+        }
+      });
+    }
     if (!mongoose.Types.ObjectId.isValid(req.params.id)) return res.status(404).json({ message: "Product not found." });
     const p = await Product.findById(req.params.id);
     if (!p || !p.isActive) return res.status(404).json({ message: "Product not found." });
@@ -346,6 +400,22 @@ api.get("/products/:id", async (req, res) => {
 // Cart
 api.get("/cart", authMiddleware, async (req, res) => {
   try {
+    if (!mongoAvailable()) {
+      const cart = inMemory.cartsByUserId.get(req.userId) || [];
+      const items = cart
+        .map((it) => {
+          const p = FALLBACK_PRODUCTS.find((x) => x.id === it.productId);
+          if (!p) return null;
+          return {
+            productId: it.productId,
+            quantity: it.quantity,
+            product: { id: p.id, name: p.name, price: p.price, imageUrl: p.imageUrl, category: p.category }
+          };
+        })
+        .filter(Boolean);
+      const subtotal = items.reduce((sum, it) => sum + it.quantity * it.product.price, 0);
+      return res.json({ items, subtotal });
+    }
     const cart = await Cart.findOne({ userId: req.userId }).lean();
     if (!cart) return res.json({ items: [], subtotal: 0 });
 
@@ -388,10 +458,21 @@ api.post("/cart/add", authMiddleware, async (req, res) => {
   try {
     const { productId, quantity } = req.body || {};
     if (!productId) return res.status(400).json({ message: "productId required." });
-    if (!mongoose.Types.ObjectId.isValid(productId)) return res.status(400).json({ message: "Invalid productId." });
     const qty = quantity ? Number(quantity) : 1;
     if (!Number.isFinite(qty) || qty < 1) return res.status(400).json({ message: "quantity must be >= 1." });
 
+    if (!mongoAvailable()) {
+      const p = FALLBACK_PRODUCTS.find((x) => x.id === productId);
+      if (!p) return res.status(404).json({ message: "Product not found." });
+      const cart = inMemory.cartsByUserId.get(req.userId) || [];
+      const found = cart.find((x) => x.productId === productId);
+      if (found) found.quantity += qty;
+      else cart.push({ productId, quantity: qty });
+      inMemory.cartsByUserId.set(req.userId, cart);
+      return res.status(201).json({ message: "Added to cart." });
+    }
+
+    if (!mongoose.Types.ObjectId.isValid(productId)) return res.status(400).json({ message: "Invalid productId." });
     const product = await Product.findById(productId);
     if (!product || !product.isActive) return res.status(404).json({ message: "Product not found." });
 
@@ -429,10 +510,22 @@ api.patch("/cart/update", authMiddleware, async (req, res) => {
   try {
     const { productId, quantity } = req.body || {};
     if (!productId) return res.status(400).json({ message: "productId required." });
-    if (!mongoose.Types.ObjectId.isValid(productId)) return res.status(400).json({ message: "Invalid productId." });
     const qty = Number(quantity);
     if (!Number.isFinite(qty) || qty < 1) return res.status(400).json({ message: "quantity must be >= 1." });
 
+    if (!mongoAvailable()) {
+      const p = FALLBACK_PRODUCTS.find((x) => x.id === productId);
+      if (!p) return res.status(404).json({ message: "Product not found." });
+      const cart = inMemory.cartsByUserId.get(req.userId);
+      if (!cart) return res.status(404).json({ message: "Cart not found." });
+      const item = cart.find((x) => x.productId === productId);
+      if (!item) return res.status(404).json({ message: "Item not found in cart." });
+      item.quantity = qty;
+      inMemory.cartsByUserId.set(req.userId, cart);
+      return res.json({ message: "Cart updated." });
+    }
+
+    if (!mongoose.Types.ObjectId.isValid(productId)) return res.status(400).json({ message: "Invalid productId." });
     const cart = await Cart.findOne({ userId: req.userId });
     if (!cart) return res.status(404).json({ message: "Cart not found." });
 
@@ -455,8 +548,18 @@ api.delete("/cart/remove", authMiddleware, async (req, res) => {
   try {
     const { productId } = req.body || {};
     if (!productId) return res.status(400).json({ message: "productId required." });
-    if (!mongoose.Types.ObjectId.isValid(productId)) return res.status(400).json({ message: "Invalid productId." });
 
+    if (!mongoAvailable()) {
+      const p = FALLBACK_PRODUCTS.find((x) => x.id === productId);
+      if (!p) return res.status(404).json({ message: "Product not found." });
+      const cart = inMemory.cartsByUserId.get(req.userId);
+      if (!cart) return res.status(404).json({ message: "Cart not found." });
+      const nextCart = cart.filter((x) => x.productId !== productId);
+      inMemory.cartsByUserId.set(req.userId, nextCart);
+      return res.json({ message: "Removed from cart." });
+    }
+
+    if (!mongoose.Types.ObjectId.isValid(productId)) return res.status(400).json({ message: "Invalid productId." });
     const cart = await Cart.findOne({ userId: req.userId });
     if (!cart) return res.status(404).json({ message: "Cart not found." });
 
@@ -476,6 +579,31 @@ api.delete("/cart/remove", authMiddleware, async (req, res) => {
 api.post("/checkout", authMiddleware, async (req, res) => {
   try {
     const { shipping } = req.body || {};
+
+    if (!mongoAvailable()) {
+      const cartItems = inMemory.cartsByUserId.get(req.userId) || [];
+      if (!cartItems || cartItems.length === 0) return res.status(400).json({ message: "Cart is empty." });
+
+      const items = cartItems
+        .map((it) => {
+          const p = FALLBACK_PRODUCTS.find((x) => x.id === it.productId);
+          if (!p) return null;
+          return { productId: it.productId, name: p.name, price: p.price, imageUrl: p.imageUrl, quantity: it.quantity };
+        })
+        .filter(Boolean);
+
+      if (items.length === 0) return res.status(400).json({ message: "No valid items in cart." });
+      const subtotal = items.reduce((sum, it) => sum + it.quantity * it.price, 0);
+
+      const order = { id: crypto.randomBytes(12).toString("hex"), items, subtotal, shipping: shipping || {}, createdAt: new Date() };
+      inMemory.orders.push(order);
+      inMemory.cartsByUserId.set(req.userId, []);
+
+      return res.status(201).json({
+        message: "Checkout successful.",
+        order: { id: order.id, subtotal: order.subtotal, createdAt: order.createdAt }
+      });
+    }
 
     const cart = await Cart.findOne({ userId: req.userId });
     if (!cart || cart.items.length === 0) return res.status(400).json({ message: "Cart is empty." });
